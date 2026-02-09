@@ -89,7 +89,8 @@ function V2V_MPC_Dynamic_Safety_Zones()
             
             next_accel = me.accel + opt_accel; 
             me.speed = me.speed + next_accel * dt;
-            if me.speed < 0, me.speed = 0; end 
+            if me.speed < 0, me.speed = 0; end
+            if me.speed > MAX_SPEED, me.speed = MAX_SPEED; end
             
             me.pos = me.pos + [cos(me.angle), sin(me.angle)] * me.speed * dt;
             me.accel = next_accel;
@@ -138,54 +139,56 @@ function [u_opt, is_overlap, extension_len] = solve_mpc_dynamic_hitbox(me, other
     is_overlap = false;
     
     % --- DYNAMIC LENGTH CALCULATION ---
-    % Stop Distance approx v^2 / 2a. 
-    % At 35 speed, need ~30m. 
-    % Safety Factor: Length + (Speed * 1.2)
-    extension_len = cl + (me.speed * 1.5); 
+    % Stop Distance approx v^2 / 2a plus reaction buffer.
+    % Clamp braking accel to avoid divide-by-zero.
+    brake_accel = max(abs(a_min), 1);
+    reaction_time = 0.75;
+    extension_len = cl + (me.speed * reaction_time) + (me.speed^2 / (2 * brake_accel));
     
     % Get My Dynamic Box
     [my_poly_x, my_poly_y] = get_world_hitbox(me.pos, me.angle, cw, cl, extension_len);
     
     if ~isempty(others)
-        other = others(1);
-        
-        % Get Their Dynamic Box (They also project forward)
-        other_ext = cl + (other.speed * 1.5);
-        [other_poly_x, other_poly_y] = get_world_hitbox(other.pos, other.angle, cw, cl, other_ext);
-        
-        if check_poly_overlap(my_poly_x, my_poly_y, other_poly_x, other_poly_y)
-            is_overlap = true;
-            should_yield = false;
-            
-            % --- STRICT PRIORITY LOGIC ---
-            
-            % 1. Rear End Check (Am I truly behind?)
-            % Vector from me to him
-            vec_to = other.pos - me.pos;
-            % Project onto my heading
-            dist_forward = dot(vec_to, [cos(me.angle), sin(me.angle)]);
-            
-            % If he is essentially "parallel" to me and in front -> I Yield
-            angle_diff = abs(angdiff(me.angle, other.angle));
-            is_parallel = angle_diff < pi/4; 
-            
-            if is_parallel && dist_forward > 0
-                should_yield = true;
-            else
-                % 2. Crossing / Intersection (Perpendicular)
-                % STRICT ID CHECK. Do NOT check "who is in front" because
-                % in a cross, both think the other is in front.
-                if me.id > other.id
-                    should_yield = true; % I yield to Lower ID
+        should_yield = false;
+        for idx = 1:length(others)
+            other = others(idx);
+
+            % Get Their Dynamic Box (They also project forward)
+            other_brake_accel = max(abs(a_min), 1);
+            other_ext = cl + (other.speed * reaction_time) + (other.speed^2 / (2 * other_brake_accel));
+            [other_poly_x, other_poly_y] = get_world_hitbox(other.pos, other.angle, cw, cl, other_ext);
+
+            if check_poly_overlap(my_poly_x, my_poly_y, other_poly_x, other_poly_y)
+                is_overlap = true;
+
+                % --- STRICT PRIORITY LOGIC ---
+
+                % 1. Rear End Check (Am I truly behind?)
+                % Vector from me to him
+                vec_to = other.pos - me.pos;
+                % Project onto my heading
+                dist_forward = dot(vec_to, [cos(me.angle), sin(me.angle)]);
+
+                % If he is essentially "parallel" to me and in front -> I Yield
+                angle_diff = abs(angdiff(me.angle, other.angle));
+                is_parallel = angle_diff < pi/4;
+
+                if is_parallel && dist_forward > 0
+                    should_yield = true;
                 else
-                    should_yield = false; % I am Priority. I Ignore collision.
+                    % 2. Crossing / Intersection (Perpendicular)
+                    % STRICT ID CHECK. Do NOT check "who is in front" because
+                    % in a cross, both think the other is in front.
+                    if me.id > other.id
+                        should_yield = true; % I yield to Lower ID
+                    end
                 end
             end
-            
-            if should_yield
-                v_ref = 0; 
-                f = M_v' * eye(Np) * w_v * (v_base - 0); 
-            end
+        end
+
+        if should_yield
+            v_ref = 0;
+            f = M_v' * eye(Np) * w_v * (v_base - 0);
         end
     end
 
@@ -234,13 +237,18 @@ end
 
 % --- STANDARD HELPERS ---
 function [x, status] = hildreth_qp_solver(H, f, A, b)
-    H_inv = inv(H + eye(size(H))*1e-6); 
-    P = A * H_inv * A'; d = b + A * H_inv * f;
+    H_reg = H + eye(size(H))*1e-6;
+    H_inv = H_reg \ eye(size(H_reg));
+    P = A * H_inv * A';
+    d = b + A * H_inv * f;
     lambda = zeros(size(A,1), 1);
     for iter = 1:100
         lambda_p = lambda;
         for i = 1:length(lambda)
             w = P(i,:)*lambda - P(i,i)*lambda(i);
+            if abs(P(i,i)) < 1e-12
+                continue;
+            end
             lambda(i) = max(0, -(d(i)+w)/P(i,i));
         end
         if norm(lambda - lambda_p) < 1e-6, break; end
